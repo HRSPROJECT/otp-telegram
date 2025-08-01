@@ -11,7 +11,28 @@ app.use(express.json());
 
 // Telegram Bot setup
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN; // Add your bot token
-const bot = new TelegramBot(BOT_TOKEN, { polling: true });
+
+if (!BOT_TOKEN) {
+  console.error('TELEGRAM_BOT_TOKEN is required!');
+  process.exit(1);
+}
+
+// Use webhook for Vercel (faster than polling)
+const bot = new TelegramBot(BOT_TOKEN, { 
+  webHook: {
+    port: process.env.PORT || 3000
+  }
+});
+
+// Set webhook URL (replace with your Vercel URL)
+const WEBHOOK_URL = process.env.WEBHOOK_URL || `https://${process.env.VERCEL_URL}`;
+if (WEBHOOK_URL && WEBHOOK_URL !== 'https://undefined') {
+  bot.setWebHook(`${WEBHOOK_URL}/bot${BOT_TOKEN}`);
+  console.log(`Webhook set to: ${WEBHOOK_URL}/bot${BOT_TOKEN}`);
+} else {
+  console.log('No webhook URL set, using polling for local development');
+  bot.startPolling();
+}
 
 // In-memory storage (use database in production)
 const otpStorage = new Map(); // chatId -> { otp, username, timestamp }
@@ -30,29 +51,78 @@ function generateSessionId() {
 // Telegram Bot handlers
 bot.onText(/\/start/, async (msg) => {
   const chatId = msg.chat.id;
-  const username = msg.from.username || msg.from.first_name || 'User';
+  const username = msg.from.username || msg.from.first_name || `user_${chatId}`;
+  const startTime = Date.now();
   
-  // Generate OTP
-  const otp = generateOTP();
-  
-  // Store OTP with timestamp (expires in 10 minutes)
-  otpStorage.set(chatId, {
-    otp: otp,
-    username: username,
-    timestamp: Date.now()
-  });
-  
-  // Send OTP to user
-  const message = `🔐 Your OTP is: *${otp}*\n\n` +
-                 `This OTP will expire in 10 minutes.\n` +
-                 `Use this code to verify your identity on our website.`;
-  
-  await bot.sendMessage(chatId, message, { parse_mode: 'Markdown' });
-  
-  console.log(`OTP ${otp} generated for user ${username} (${chatId})`);
+  try {
+    // Generate OTP immediately
+    const otp = generateOTP();
+    const timestamp = Date.now();
+    
+    // Store OTP with timestamp (expires in 10 minutes)
+    otpStorage.set(chatId, {
+      otp: otp,
+      username: username,
+      timestamp: timestamp
+    });
+    
+    // Send OTP to user with minimal formatting for speed
+    const message = `🔐 OTP: *${otp}*\n⏰ Expires in 10 minutes\n🌐 Use on verification form`;
+    
+    // Send message with error handling
+    const sendResult = await bot.sendMessage(chatId, message, { 
+      parse_mode: 'Markdown',
+      disable_notification: false
+    });
+    
+    const endTime = Date.now();
+    console.log(`✅ OTP ${otp} sent to ${username} (${chatId}) in ${endTime - startTime}ms`);
+    
+  } catch (error) {
+    console.error('❌ Error in /start handler:', error);
+    
+    // Fallback: send simple text message
+    try {
+      await bot.sendMessage(chatId, `Your OTP is: ${otp}\nExpires in 10 minutes.`);
+    } catch (fallbackError) {
+      console.error('❌ Fallback message also failed:', fallbackError);
+    }
+  }
+});
+
+// Handle any text message as potential /start
+bot.on('message', async (msg) => {
+  if (msg.text && msg.text.toLowerCase().includes('start')) {
+    // Trigger start handler
+    bot.emit('text', msg, [msg.text, 'start']);
+  }
+});
+
+// Add error handling for bot
+bot.on('error', (error) => {
+  console.error('❌ Telegram Bot Error:', error);
+});
+
+bot.on('polling_error', (error) => {
+  console.error('❌ Polling Error:', error);
+});
+
+bot.on('webhook_error', (error) => {
+  console.error('❌ Webhook Error:', error);
 });
 
 // API Routes
+
+// Webhook handler for Telegram
+app.post(`/bot${BOT_TOKEN}`, (req, res) => {
+  bot.processUpdate(req.body);
+  res.sendStatus(200);
+});
+
+// Health check
+app.get('/health', (req, res) => {
+  res.json({ status: 'OK', timestamp: new Date().toISOString() });
+});
 
 // Get user info by chat ID (for testing)
 app.get('/api/user/:chatId', (req, res) => {
